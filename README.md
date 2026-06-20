@@ -144,3 +144,6 @@ Selective-SSM ("Mamba-ish") + Koopman latent linearity + RL (A2C) on POMDP CartP
 ## Notes
 
 This repository is intended for research and educational purposes, particularly for studying Koopman-based modeling and control in building energy systems and related thermal processes.
+
+
+> 📌 For the latest papers, benchmarks, datasets, and state-of-the-art research on **World Models**, particularly **Spatial and 3D World Models**, please visit our companion repository: **[Awesome Spatial and 3D World Models](https://github.com/Masoudjafaripour/Awesome-Spatial-and-3D-World-Models)**.
