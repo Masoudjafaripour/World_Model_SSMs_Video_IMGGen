@@ -1,4 +1,4 @@
-# Using Deep-Koopman and State-Space Models (SSMs) for World Modeling
+# World Models, Three Ways: Koopman Operators, Selective SSMs & Learned Video Dynamics
 
 ## Section 1
 
@@ -117,18 +117,57 @@ Selective-SSM ("Mamba-ish") + Koopman latent linearity + RL (A2C) on POMDP CartP
 
 ---
 
+## Section 3: Grid-World & Maze Video World Models
+
+A third, complementary line of work moves away from Koopman/SSM latent dynamics and instead learns **pixel-space world models**: a CNN maps `(current image, action) → next image` directly, with no explicit state representation or dynamics equations. Planning is then done by rolling the learned model forward and greedily minimizing predicted distance-to-goal.
+
+Both experiments share the same recipe:
+
+* Render the environment as a multi-channel semantic image (one channel each for obstacles/walls, start, goal, agent).
+* Train a small CNN encoder–decoder (`TinyCNNWorldModel` / `TinyMazeWorldModel`) on randomly sampled `(state, action, next_state)` transitions, using a positive-pixel-weighted BCE loss (agent/goal pixels are rare, so under-weighting them collapses training).
+* At test time, decode the predicted agent position from the model's imagined next frame, and greedily pick the action whose imagined outcome is closest (Manhattan distance) to the goal, with a penalty for revisiting cells.
+
+**Grid World** ([`WM/Video_Models/GridWM.py`](WM/Video_Models/GridWM.py)): 9×9 grid with block obstacles, start `(0,0)`, goal `(6,6)`.
+
+<p align="center">
+  <img src="results/Grid_World_Model.png" width="900" />
+</p>
+
+**Figure:** Rollout of the learned CNN world model driving greedy planning — the agent reaches the goal in 12 steps, navigating around obstacles using only image-conditioned next-state predictions (no ground-truth dynamics).
+
+**Maze** ([`WM/Video_Models/Video_GridWM.py`](WM/Video_Models/Video_GridWM.py)): 7×7 maze with explicit interior walls, start `(6,0)`, goal `(0,6)`. Includes a BFS oracle (`bfs_oracle_path`) for comparison against the true shortest path.
+
+<p align="center">
+  <img src="results/Maze_WM_Video.png" width="900" />
+</p>
+
+**Figure:** The learned model correctly predicts the first couple of moves, but the greedy planner then stalls at `(4,0)` and never reaches the goal. Because the policy is a memoryless one-step-lookahead over the Manhattan-distance heuristic, it has no way to backtrack out of a local optimum once a wall blocks the locally-best action — unlike the open grid-world case, tight maze corridors expose this limitation of greedy planning over a learned model.
+
+A related, unexecuted script, [`WM/Video_Models/VM_Planning.py`](WM/Video_Models/VM_Planning.py), sketches a larger video-world-model pipeline (VQ-VAE tokenizer + SSM latent dynamics + MPC) for MetaWorld robotic manipulation, following [iVideoGPT](https://github.com/thuml/iVideoGPT); it depends on external packages (`metaworld`, `mujoco`) not vendored here and has no results yet.
+
+---
+
 ## Repository Structure
 
 ```
 .
-├── data/ # (Optional) datasets or generated simulation data
+├── results/                        # Experimental results and figures
+│ ├── Koopman_plot1.png             # True vs Koopman rollout comparison
+│ ├── Grid_World_Model.png          # Grid-world CNN world-model rollout
+│ └── Maze_WM_Video.png             # Maze CNN world-model rollout
 │
-├── results/ # Experimental results and figures
-│ └── Koopman_plot1.png # True vs Koopman rollout comparison
+├── src/                             # Koopman / SSM source code
+│ ├── 2R2C_Lifted_EDMD.m            # MATLAB EDMD-based Koopman identification (RBF lifting)
+│ ├── deep_koopman_2RRC.py          # Python Deep Koopman implementation (neural lifting)
+│ ├── deep_koopman_cartpole.py      # Deep Koopman on CartPole
+│ ├── ssm_world_model_koopman_rl.py # Selective-SSM + Koopman + A2C on POMDP CartPole
+│ └── simple_WM.py
 │
-├── src/ # Source code
-│ ├── 2R2C_Lifted_EDMD.m # MATLAB EDMD-based Koopman identification (RBF lifting)
-│ └── deep_koopman_2RRC.py # Python Deep Koopman implementation (neural lifting)
+├── WM/Video_Models/                 # Pixel-space (image/video) world models
+│ ├── GridWM.py                     # Grid-world CNN world model + greedy planning
+│ ├── Video_GridWM.py               # Maze CNN world model + greedy planning + BFS oracle
+│ └── VM_Planning.py                # VQ-VAE + SSM + MPC sketch for robotic manipulation
+│
 ├── README.md
 ```
 
