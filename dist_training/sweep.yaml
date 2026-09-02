@@ -1,0 +1,27 @@
+# MAIN GRID -- 112 arms. Every arm holds global_batch_tokens constant, so model
+# quality is identical by construction and only systems metrics vary.
+# The full cross-product (seeds x micro_bs x checkpointing) is 1344 arms and does
+# not fit a 5-day window; those axes are split into ablations.yaml / variance.yaml.
+n_gpus: 4
+out_dir: results
+steps: 60
+seeds: 1
+order_seed: 0
+
+phases:        [pretrain, finetune]
+model_sizes:   [S, L]
+strategies:    [single, ddp, zero2, fsdp, tp, pp, tp_dp]
+seq_lens:      [1024, 2048, 4096, 8192]
+micro_bs:      [1]
+checkpointing: [false]
+
+common:
+  global_batch_tokens: 524288
+  warmup: 20
+  lr: 1.0e-4
+  lora_r: 16
+  data_source: synthetic
+  n_clips: 4096
+  in_dim: 16
+  action_dim: 8
+  gpu: a6000

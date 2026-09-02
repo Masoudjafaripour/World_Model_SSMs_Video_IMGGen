@@ -1,0 +1,6 @@
+torch>=2.6
+numpy
+pyyaml
+matplotlib
+tqdm
+wandb

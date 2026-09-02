@@ -1,0 +1,13 @@
+# Checkpointing and micro-batch axes, at s=8192 only (where they matter).
+# Tests prediction 6: checkpointing buys more memory per unit slowdown than TP.
+n_gpus: 4
+out_dir: results
+steps: 60
+seeds: 1
+phases:        [pretrain, finetune]
+model_sizes:   [S]
+strategies:    [single, ddp, fsdp, tp, tp_dp]
+seq_lens:      [8192]
+micro_bs:      [1, 4]
+checkpointing: [false, true]
+common: {global_batch_tokens: 524288, warmup: 20, data_source: synthetic, gpu: a6000}

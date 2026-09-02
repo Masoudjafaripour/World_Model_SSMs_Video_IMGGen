@@ -1,0 +1,18 @@
+# One-week version: still tests predictions 2, 3 and the regime flip.
+n_gpus: 4
+out_dir: results
+steps: 60
+seeds: 1
+order_seed: 0
+phases:        [pretrain, finetune]
+model_sizes:   [S]
+strategies:    [single, ddp, fsdp, tp, tp_dp]
+seq_lens:      [2048, 8192]
+micro_bs:      [1]
+checkpointing: [false]
+common:
+  global_batch_tokens: 262144
+  warmup: 20
+  data_source: synthetic
+  n_clips: 2048
+  gpu: a6000

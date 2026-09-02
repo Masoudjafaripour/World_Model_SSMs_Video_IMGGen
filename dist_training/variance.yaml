@@ -1,0 +1,13 @@
+# 3 seeds on a small subset, to establish run-to-run variance before claiming
+# any effect. If seed variance exceeds an effect size, that effect is not real.
+n_gpus: 4
+out_dir: results
+steps: 60
+seeds: 3
+phases:        [pretrain]
+model_sizes:   [S]
+strategies:    [single, ddp, fsdp, tp]
+seq_lens:      [8192]
+micro_bs:      [1]
+checkpointing: [false]
+common: {global_batch_tokens: 524288, warmup: 20, data_source: synthetic, gpu: a6000}
