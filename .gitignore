@@ -24,3 +24,4 @@ wm_venv
 results
 wandb
 __pycache__/
+*.pt
