@@ -83,8 +83,11 @@ Each run writes to `results/` (created next to `ViT_Video_Model.py`):
 
 * `ViT_Video_WM.pt` — model checkpoint (`--save` to change the path; `--resume` to continue from one)
 * `ViT_Video_WM_loss.png` — training loss curve, rewritten after every epoch so you can watch it update mid-run
-* `ViT_Video_WM_rollout.png` — the learned-model greedy-planning rollout (skipped with `--no-plot`)
+* `ViT_Video_WM_rollout.png` — static grid of the greedy-planning rollout; each frame is captioned with the action taken, the resulting position, and the Manhattan distance to the goal, plus a color legend for walls/start/goal/agent
+* `ViT_Video_WM_rollout.gif` / `.mp4` — the same rollout as an animation, one frame per planning step (needs `imageio` + `imageio-ffmpeg`: `pip install imageio imageio-ffmpeg`, no system ffmpeg required)
+
+All plotting/video outputs are skipped with `--no-plot`.
 
 ## Result
 
-Flow loss drops from ~0.84 to a ~0.35 plateau over 15 epochs (2250 steps, ~2 min on a V100). The denoiser learns plausible next-frame structure, but the same one-step-greedy planner used by `Video_GridWM.py` still struggles on the maze — it reaches fewer, noisier hops than the CNN baseline and is more prone to a slightly wrong agent-position decode, since diffusion samples are noisier than the CNN's direct regression. This isolates the greedy-planning limitation (already noted in the top-level README for the CNN maze model) from the quality of the dynamics model itself.
+Flow loss drops from ~0.84 to a ~0.35 plateau over 15 epochs (2250 steps, ~2 min on a V100) — and holds at the same plateau even after 50 epochs / 12.5k steps at a lower LR, so it isn't just undertrained. Inspecting the rollout visually (which is what motivated adding proper captions) shows why: on the sparse start/goal/agent channels, the model activates >0.5 on ~16% of pixels versus ~0.2% in the real data — heavily over-predicting those channels almost everywhere, so denoised frames look like colored noise instead of a small localized square. The walls channel (much less sparse, ~32% of pixels) is fit far better. This points at the same issue the CNN baseline in `Video_GridWM.py` explicitly corrects for with a 12x positive-pixel loss weight, which `flow_loss` here doesn't yet have — that reweighting is the natural next fix, not more training. Path lengths from greedy planning are consequently noisy and occasionally *shorter* than the BFS-optimal length, which is actually a decode error (the noisy agent channel gets misread as sitting on the goal cell), not a real solution.

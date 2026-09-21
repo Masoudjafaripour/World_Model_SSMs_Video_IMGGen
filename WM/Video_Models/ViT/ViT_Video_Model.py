@@ -10,12 +10,14 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib
 matplotlib.use("Agg")         # headless-safe: results are saved to disk, not shown
 import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
 
 
 def _find_upward(start: Path, name: str) -> Path:
@@ -32,7 +34,7 @@ sys.path.insert(0, str(_find_upward(_HERE, "Video_GridWM.py")))
 from Video_GridWM import (
     GRID, CELL, IMG, DEVICE, START, GOAL,
     render_state, step, sample_batch, decode_agent,
-    bfs_oracle_path, to_rgb, show_maze_state,
+    bfs_oracle_path, to_rgb, show_maze_state, ACTION_NAMES,
 )
 
 PATCH = CELL                 # one ViT patch == one maze cell
@@ -236,6 +238,7 @@ def plan_with_learned_model(model, start=START, goal=GOAL, max_steps=30, steps=4
     agent = start
     path = [agent]
     frames = [render_state(agent)]
+    actions = []           # actions[i] is the move taken from path[i] to path[i+1]
     visited = set()
 
     for _ in range(max_steps):
@@ -260,21 +263,92 @@ def plan_with_learned_model(model, start=START, goal=GOAL, max_steps=30, steps=4
         visited.add(agent)
         path.append(agent)
         frames.append(pred_img)
+        actions.append(action)
 
-    return path, frames
+    return path, frames, actions
 
 
-def plot_rollout(path, frames, max_show=12, save_path=RESULTS_DIR / "ViT_Video_WM_rollout.png"):
+# -----------------------------
+# Rollout visualization: static grid (PNG) + animated GIF/MP4, all with
+# readable per-frame captions (position, action taken, distance-to-goal).
+# -----------------------------
+LEGEND_ITEMS = [
+    ("walls", (0.0, 0.0, 0.0)),
+    ("start", (0.85, 0.1, 0.1)),
+    ("goal", (0.0, 0.8, 0.2)),
+    ("agent", (0.1, 0.2, 0.9)),
+]
+
+
+def _frame_caption(t, pos, goal, action=None):
+    dist = abs(pos[0] - goal[0]) + abs(pos[1] - goal[1])
+    tag = "  ✓ goal" if pos == goal else f"  dist={dist}"
+    if action is None:
+        return f"t={t}  start {pos}{tag}"
+    return f"t={t}  {ACTION_NAMES[action]} → {pos}{tag}"
+
+
+def _draw_frame(ax, img, caption):
+    ax.imshow(to_rgb(img))
+    ax.set_title(caption, fontsize=9)
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def plot_rollout(path, frames, actions, goal=GOAL, max_show=12,
+                  save_path=RESULTS_DIR / "ViT_Video_WM_rollout.png"):
     n = min(len(frames), max_show)
-    plt.figure(figsize=(2.2 * n, 2.5))
+    fig, axes = plt.subplots(1, n, figsize=(2.4 * n, 3.0))
+    axes = [axes] if n == 1 else list(axes)
 
     for t in range(n):
-        plt.subplot(1, n, t + 1)
-        show_maze_state(frames[t], f"t={t}\n{path[t]}")
+        action = actions[t - 1] if t > 0 else None
+        _draw_frame(axes[t], frames[t], _frame_caption(t, path[t], goal, action))
 
-    plt.tight_layout()
-    plt.savefig(save_path)
-    plt.close()
+    fig.legend(handles=[Patch(facecolor=c, label=l) for l, c in LEGEND_ITEMS],
+               loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.02), frameon=False)
+    steps_shown = "" if n == len(frames) else f" (first {n} of {len(frames)} steps)"
+    fig.suptitle(f"Greedy rollout: {path[0]} → {goal}{steps_shown}")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    fig.savefig(save_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _frame_to_array(img, caption, figsize=(3.2, 3.52), dpi=100):
+    # dims chosen to land on multiples of 16 (320x352) so ffmpeg's mp4 encoder
+    # doesn't need to pad/resize each frame
+    fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+    _draw_frame(ax, img, caption)
+    fig.legend(handles=[Patch(facecolor=c, label=l) for l, c in LEGEND_ITEMS],
+               loc="lower center", ncol=4, fontsize=6, frameon=False)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.canvas.draw()
+    arr = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return arr
+
+
+def save_rollout_video(path, frames, actions, goal=GOAL, fps=2, hold_last_secs=1.5,
+                        gif_path=RESULTS_DIR / "ViT_Video_WM_rollout.gif",
+                        mp4_path=RESULTS_DIR / "ViT_Video_WM_rollout.mp4"):
+    """Render the full rollout as an annotated GIF + MP4 (needs `imageio[ffmpeg]`)."""
+    try:
+        import imageio.v2 as imageio
+    except ImportError as e:
+        raise ImportError(
+            "GIF/MP4 export needs imageio: pip install imageio imageio-ffmpeg"
+        ) from e
+
+    arrays = [
+        _frame_to_array(frames[t], _frame_caption(t, path[t], goal, actions[t - 1] if t > 0 else None))
+        for t in range(len(frames))
+    ]
+    arrays += [arrays[-1]] * max(0, round(fps * hold_last_secs) - 1)   # hold on final frame
+
+    imageio.mimsave(gif_path, arrays, duration=1.0 / fps, loop=0)
+    imageio.mimsave(mp4_path, arrays, fps=fps)
+
+    return gif_path, mp4_path
 
 
 if __name__ == "__main__":
@@ -314,7 +388,7 @@ if __name__ == "__main__":
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {n_params / 1e6:.2f}M")
 
-    learned_path, learned_frames = plan_with_learned_model(model, steps=args.sample_steps)
+    learned_path, learned_frames, learned_actions = plan_with_learned_model(model, steps=args.sample_steps)
     print("\nLearned ViT-diffusion path:")
     print(learned_path)
 
@@ -323,5 +397,9 @@ if __name__ == "__main__":
     print(oracle)
 
     if not args.no_plot:
-        plot_rollout(learned_path, learned_frames)
+        plot_rollout(learned_path, learned_frames, learned_actions)
         print(f"Saved rollout plot to {RESULTS_DIR / 'ViT_Video_WM_rollout.png'}")
+
+        gif_path, mp4_path = save_rollout_video(learned_path, learned_frames, learned_actions)
+        print(f"Saved rollout gif to {gif_path}")
+        print(f"Saved rollout mp4 to {mp4_path}")
