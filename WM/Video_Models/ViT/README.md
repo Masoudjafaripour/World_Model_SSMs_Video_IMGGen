@@ -75,8 +75,12 @@ python ViT_Video_Model.py \
     --resume results/ViT_Video_WM.pt --epochs 3 --steps-per-epoch 100 --lr 1e-4 \
     --save results/ViT_Video_WM_ft.pt
 
-# More Euler steps at inference (slower, usually sharper next-frame samples), no plotting
-python ViT_Video_Model.py --resume results/ViT_Video_WM.pt --epochs 0 --sample-steps 8 --no-plot
+# Inference only: no training, just re-run planning on an existing checkpoint
+# and (re)generate the rollout PNG/GIF/MP4 — use this to just look at rollouts
+python ViT_Video_Model.py --resume results/ViT_Video_WM.pt --infer-only
+
+# Inference only, with more Euler steps (slower, usually sharper next-frame samples)
+python ViT_Video_Model.py --resume results/ViT_Video_WM.pt --infer-only --denoising-steps 8
 ```
 
 Each run writes to `results/` (created next to `ViT_Video_Model.py`):

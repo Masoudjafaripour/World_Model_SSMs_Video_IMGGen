@@ -113,6 +113,13 @@ class ViTVideoWorldModel(nn.Module):
     Current-frame patches are concatenated (channel-wise) with the noisy
     next-frame patches, so the ViT attends jointly over "what is" and "what
     might be next"; action + diffusion time enter via adaLN-zero.
+
+    The network directly predicts the clean target frame x1 (not the
+    velocity x1-x0): velocity targets blow up as t->1 (dividing by (1-t)),
+    which this tiny model + plain AdamW training can't fit well, while x1
+    is bounded in [0,1] regardless of t. Velocity is only reconstructed at
+    sampling time, where the (1-t) factor stays well away from 0 by
+    construction (see sample_next).
     """
 
     def __init__(self, dim=96, depth=4, n_heads=4, mlp_ratio=4):
@@ -147,24 +154,33 @@ class ViTVideoWorldModel(nn.Module):
 # -----------------------------
 # Rectified-flow objective + few-step sampling
 # -----------------------------
-def flow_loss(model, obs, action, next_obs):
+def flow_loss(model, obs, action, next_obs, pos_weight=12.0):
     x0 = torch.randn_like(next_obs)
     t = torch.rand(obs.shape[0], device=obs.device)
     xt = (1 - t[:, None, None, None]) * x0 + t[:, None, None, None] * next_obs
 
-    v_pred = model(obs, xt, t, action)
-    v_target = next_obs - x0
-    return F.mse_loss(v_pred, v_target)
+    x1_pred = model(obs, xt, t, action)   # predicts the clean frame directly
+
+    # start/goal/agent pixels are a tiny fraction of the image; unweighted MSE
+    # lets the model shrug them off and still get a low loss (same issue
+    # Video_GridWM.py's CNN loss corrects for with the same 12x weight)
+    weight = torch.ones_like(next_obs)
+    weight[next_obs > 0.5] = pos_weight
+    return (weight * (x1_pred - next_obs) ** 2).mean()
 
 
 @torch.no_grad()
 def sample_next(model, obs, action, steps=4):
+    """DDIM-style update from an x1-predicting model: at step k (t_k=k/steps),
+    move a 1/(steps-k) fraction of the way from x toward the model's current
+    x1 prediction. The last step (k=steps-1) always lands exactly on x1_pred,
+    so (1-t) is never divided anywhere near 0."""
     x = torch.randn_like(obs)
-    dt = 1.0 / steps
 
-    for i in range(steps):
-        t = torch.full((obs.shape[0],), i * dt, device=obs.device)
-        x = x + model(obs, x, t, action) * dt
+    for k in range(steps):
+        t = torch.full((obs.shape[0],), k / steps, device=obs.device)
+        x1_pred = model(obs, x, t, action)
+        x = x + (x1_pred - x) / (steps - k)
 
     return x
 
@@ -359,10 +375,13 @@ if __name__ == "__main__":
     parser.add_argument("--steps-per-epoch", type=int, default=150)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--resume", type=str, default=None, help="checkpoint to fine-tune from")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint to fine-tune from (or run inference on)")
     parser.add_argument("--save", type=str, default=str(RESULTS_DIR / "ViT_Video_WM.pt"))
-    parser.add_argument("--sample-steps", type=int, default=4, help="Euler steps at inference")
+    parser.add_argument("--denoising-steps", type=int, default=4,
+                         help="Euler integration steps for rectified-flow sampling at inference")
     parser.add_argument("--no-plot", action="store_true")
+    parser.add_argument("--infer-only", action="store_true",
+                         help="skip training; requires --resume, just re-runs planning + saves rollout outputs")
     args = parser.parse_args()
 
     print("Device:", DEVICE)
@@ -371,24 +390,30 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    init_model = load_checkpoint(args.resume) if args.resume else None
+    if args.infer_only:
+        if not args.resume:
+            parser.error("--infer-only requires --resume <checkpoint>")
+        model = load_checkpoint(args.resume)
+        print(f"Loaded checkpoint from {args.resume} (no training)")
+    else:
+        init_model = load_checkpoint(args.resume) if args.resume else None
 
-    model, losses = train_model(
-        epochs=args.epochs,
-        steps_per_epoch=args.steps_per_epoch,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        model=init_model,
-    )
+        model, losses = train_model(
+            epochs=args.epochs,
+            steps_per_epoch=args.steps_per_epoch,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            model=init_model,
+        )
 
-    save_checkpoint(model, args.save)
-    print(f"Saved checkpoint to {args.save}")
-    print(f"Saved loss curve to {RESULTS_DIR / 'ViT_Video_WM_loss.png'}")
+        save_checkpoint(model, args.save)
+        print(f"Saved checkpoint to {args.save}")
+        print(f"Saved loss curve to {RESULTS_DIR / 'ViT_Video_WM_loss.png'}")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Params: {n_params / 1e6:.2f}M")
 
-    learned_path, learned_frames, learned_actions = plan_with_learned_model(model, steps=args.sample_steps)
+    learned_path, learned_frames, learned_actions = plan_with_learned_model(model, steps=args.denoising_steps)
     print("\nLearned ViT-diffusion path:")
     print(learned_path)
 
