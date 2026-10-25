@@ -1,0 +1,18 @@
+# Installed from the cluster wheelhouse (pip install --no-index); see slurm/setup_env.sh.
+# pyarrow comes from the arrow/25.0.0 module, not pip.
+torch
+torchvision
+transformers
+safetensors
+sentencepiece
+huggingface_hub
+datasets
+numpy
+pillow
+av
+webdataset
+einops
+pyyaml
+tqdm
+matplotlib
+wandb
