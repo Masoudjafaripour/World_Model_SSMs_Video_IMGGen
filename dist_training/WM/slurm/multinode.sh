@@ -10,7 +10,7 @@
 #SBATCH --output=/scratch/masod110/World_Model_SSMs_Video_IMGGen/dist_training/WM/logs/%x_%j.out
 # Multi-node DDP: one torchrun per node, 4 GPUs each, rendezvous on the first node.
 #   sbatch slurm/multinode.sh smoke_test.py                       # interconnect + busbw check
-#   sbatch --nodes=2 --time=12:00:00 slurm/multinode.sh train_bc.py --run b_2n --size B
+#   sbatch --nodes=2 --time=12:00:00 slurm/multinode.sh train_bc.py --name b_2n --size B
 set -euo pipefail
 WM_SRC=${SLURM_SUBMIT_DIR:-$(pwd)}
 source "$WM_SRC/slurm/env.sh"

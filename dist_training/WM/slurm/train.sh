@@ -8,8 +8,8 @@
 #SBATCH --output=/scratch/masod110/World_Model_SSMs_Video_IMGGen/dist_training/WM/logs/%x_%j.out
 # Single-node BC training; scale by overriding the sbatch flags, e.g. 4 GPUs:
 #   sbatch --gres=gpu:l40s:4 --cpus-per-task=32 --mem=160G --time=12:00:00 \
-#          slurm/train.sh --run s_ddp4 --size S --max_minutes 700
-# Arguments after the script name go to train_bc.py. Resubmitting the same --run resumes.
+#          slurm/train.sh --name s_ddp4 --size S --max_minutes 700
+# Arguments after the script name go to train_bc.py. Resubmitting the same --name resumes.
 set -euo pipefail
 WM_SRC=${SLURM_SUBMIT_DIR:-$(pwd)}
 source "$WM_SRC/slurm/env.sh"
