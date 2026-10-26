@@ -168,6 +168,10 @@ A related, unexecuted script, [`WM/Video_Models/VM_Planning.py`](WM/Video_Models
 │ ├── Video_GridWM.py               # Maze CNN world model + greedy planning + BFS oracle
 │ └── VM_Planning.py                # VQ-VAE + SSM + MPC sketch for robotic manipulation
 │
+├── dist_training/                   # Multi-GPU training of world models
+│ ├── parallelism/                  # DDP / ZeRO / FSDP / TP / PP study + cost model (src/, configs/)
+│ └── WM/                           # Language-conditioned BC + world-model loss on LIBERO, DDP
+│
 ├── README.md
 ```
 

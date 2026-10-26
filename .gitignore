@@ -25,3 +25,4 @@ results
 wandb
 __pycache__/
 *.pt
+dist_training/WM/runs

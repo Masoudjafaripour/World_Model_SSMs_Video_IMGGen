@@ -1,12 +1,12 @@
 """BC (+ world loss) training on cached LIBERO features. 1 GPU or N GPUs (DDP).
 
-  python train_bc.py --run t_overfit --size T --overfit_episodes 8 --steps 2000
-  torchrun --standalone --nproc_per_node=4 train_bc.py --run s_ddp4 --size S
+  python train_bc.py --name t_overfit --size T --overfit_episodes 8 --steps 2000
+  torchrun --standalone --nproc_per_node=4 train_bc.py --name s_ddp4 --size S
 
 Checkpoint policy (README "Checkpoints"): only rank 0 writes, and a run dir
 holds at most last.pt (resume; atomic overwrite), best.pt (weights, bf16, best
 val BC loss) and final.pt (weights, bf16). last.pt is deleted when a run
-finishes. Rerunning the same --run resumes from last.pt.
+finishes. Rerunning the same --name resumes from last.pt.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # dist_training/metrics.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "parallelism" / "src"))  # metrics.py
 import metrics as M  # noqa: E402
 from libero_data import LiberoFeatures  # noqa: E402
 from wla_model import SIZES, WLAPolicy, wla_loss  # noqa: E402
@@ -34,7 +34,7 @@ from wla_model import SIZES, WLAPolicy, wla_loss  # noqa: E402
 
 @dataclass
 class Cfg:
-    run: str = "debug"
+    name: str = "debug"
     size: str = "S"
     lam: float = 0.0                 # world-loss weight; 0 = plain BC
     future_k: int = 4
@@ -175,7 +175,7 @@ def main(cfg: Cfg):
     torch.manual_seed(cfg.seed + rank)
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    run_dir = Path(cfg.runs) / cfg.run
+    run_dir = Path(cfg.runs) / cfg.name
     run_dir.mkdir(parents=True, exist_ok=True)
 
     mcfg = SIZES[cfg.size]
@@ -212,14 +212,14 @@ def main(cfg: Cfg):
             {**asdict(cfg), "model": asdict(mcfg), "n_params": n_params, "world": world,
              "global_batch": cfg.batch * world, "train_samples": len(train_ds),
              "val_samples": len(val_ds)}, indent=1))
-        print(f"[{cfg.run}] {n_params/1e6:.1f}M params, {world} GPU(s), global batch "
+        print(f"[{cfg.name}] {n_params/1e6:.1f}M params, {world} GPU(s), global batch "
               f"{cfg.batch*world}, {len(train_ds)} train / {len(val_ds)} val samples", flush=True)
 
     wb = None
     if cfg.wandb and is_main():
         import wandb
-        wb = wandb.init(project="wla-libero", name=cfg.run, config=asdict(cfg),
-                        dir=str(run_dir), mode="offline", resume="allow", id=cfg.run)
+        wb = wandb.init(project="wla-libero", name=cfg.name, config=asdict(cfg),
+                        dir=str(run_dir), mode="offline", resume="allow", id=cfg.name)
 
     def save_last():
         if is_main():

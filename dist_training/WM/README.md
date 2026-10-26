@@ -1,266 +1,314 @@
-# World-Language-Action model: multi-GPU behaviour cloning
+# Language-Conditioned Behaviour Cloning with an Auxiliary World-Model Loss, Trained Data-Parallel
 
-Language-conditioned behaviour cloning (BC) with an auxiliary **world-model**
-loss, pretrained on open robot datasets and trained data-parallel on a GPU cluster
-(4× L40S per node).
-
-**Status:** setup. Goal right now is a *working pipeline*, kept simple:
-single node first, multi-node later.
+**Status (2026-10-26):** pipeline working end to end on LIBERO, on 1 GPU and on
+1 node × 4 GPUs. The main comparison, plain BC (λ = 0) vs BC + world loss
+(λ > 0), is running at the 300M scale. Closed-loop simulator evaluation is being
+set up.
 
 ---
 
-## Idea
+## Abstract
+
+We train a language-conditioned visuomotor policy by **behaviour cloning (BC)**
+and add an auxiliary **world-model** objective: the same network that predicts
+an action chunk also predicts the visual features of a future frame. Frozen
+SigLIP encoders are run once over the dataset and cached, so training touches
+only a small transformer over cached features. The data loader then takes
+1–2% of step time, and data-parallel training reaches **3.4× on 4 GPUs (85%
+scaling efficiency)**. On LIBERO (40 tasks, 1693 demonstrations), a 27M-parameter
+policy reaches a held-out validation BC loss of **0.131** in 17 min on one GPU, or
+5 min on four. The open question this setup is built to answer is whether the
+world loss improves closed-loop task success over plain BC.
+
+---
+
+## 1. Introduction
+
+Behaviour cloning learns a policy by regressing expert actions from observations.
+It is simple and scales with data and compute. But it learns nothing about
+*how the world changes*, and it degrades once the policy leaves the expert's
+state distribution.
+
+This project tests two additions on top of a plain, scalable BC pipeline:
+
+1. **An auxiliary world-model loss.** The policy also predicts the encoder
+   features of the frame k steps ahead, and the action tokens may attend to that
+   prediction.
+2. **DAgger** (planned). Retraining on states the policy itself visits, labelled
+   by an expert, to reduce compounding error.
+
+Everything is built to run data-parallel, scaling gradually from 1 GPU to 1 node
+(4 GPUs) and then to several nodes.
+
+---
+
+## 2. Method
+
+### 2.1 Problem formulation
+
+A demonstration is a sequence of frames $o_t$, robot states $s_t$ and actions
+$a_t \in \mathbb{R}^7$, with an instruction $\ell$. Frozen encoders give
+language tokens $E_\text{txt}(\ell) \in \mathbb{R}^{32 \times 768}$ and image
+tokens $E(o_t) \in \mathbb{R}^{49 \times 768}$ (SigLIP-B/16 patch tokens,
+2×2-pooled to 7×7).
+
+A trainable transformer $f_\theta$ predicts an action chunk and future features:
+
+$$(\hat a_{t:t+H},\ \hat z_{t+k}) = f_\theta\big(E_\text{txt}(\ell),\ E(o_{t-1}),\ E(o_t),\ s_t\big), \qquad H = 8,\ k = 4$$
+
+### 2.2 Objective
+
+$$\mathcal L(\theta) = \underbrace{\big\lVert \hat a_{t:t+H} - a_{t:t+H} \big\rVert_1}_{\text{behaviour cloning}} \;+\; \lambda\,\underbrace{\Big[\big(1 - \cos(\hat z_{t+k}, z_{t+k})\big) + \big\lVert \hat z_{t+k} - z_{t+k} \big\rVert_2^2\Big]}_{\text{world model}}, \qquad z_{t+k} = \mathrm{LN}\big(E(o_{t+k})\big)$$
+
+* Actions are normalised per dimension to $[-1, 1]$ using the 1st/99th
+  percentiles of the training split. The gripper is already $\pm 1$.
+* Action steps past the end of an episode are masked out of the L1 term.
+* The world target is a frozen-encoder output (stop-gradient by construction)
+  and is LayerNorm'd. Predicting *features* rather than pixels keeps this term
+  cheap and stable.
+* **λ = 0 is exactly plain BC** (see §2.3), the baseline for every comparison.
+
+### 2.3 Architecture
+
+One token sequence per sample (188 tokens) through a single transformer trunk:
 
 ```
- instruction ──► frozen text encoder (cached once) ─────┐
- frames t-1,t ─► frozen vision encoder ─► patch tokens ──┤
- proprio ──────► MLP ────────────────────────────────────┤
-                                                         ▼
-                        trainable transformer (~300M)
-                         │                          │
-              action head (chunk of H     world head (vision-encoder
-              future actions)             features of frame t+k)
+ [ lang ×32 | obs t-1 ×49 | obs t ×49 | proprio ×1 | world queries ×49 | action queries ×8 ]
+ └──────────────────── context (131) ──────────────┘ └────────── learned queries ──────────┘
 ```
-
-`loss = L_BC(actions) + λ · L_world(future features)`
-
-Predicting *features* of a future frame, not pixels, keeps the world loss cheap
-and stable. λ = 0 is plain BC and is the baseline every result is compared to.
-
-## Architecture
-
-One token sequence per sample, processed by a single trunk:
-
-```
- [ lang ×16 | obs t-1 ×49 | obs t ×49 | proprio ×1 | world queries ×49 | action queries ×H ]
- └──────────────── context (102) ───────────────────┘ └──── learned queries ──────────────┘
-                                                          ≈ 160 tokens total (H = 8)
-```
-
-### Blocks
 
 | # | Block | In → Out | Trainable | Notes |
 |---|---|---|---|---|
-| 1 | **Language encoder** | instruction → 16 × 768 | ❄️ frozen | SigLIP text tower. Cached once per unique instruction, never run during training. |
-| 2 | **Vision encoder** | 224² RGB → 196 × 768 → **49 × 768** | ❄️ frozen | SigLIP-B/16, 2×2 avg-pool to a 7×7 grid. Run once per frame: the frames at t−1 and t feed the context, and the frame at t+k becomes the world target. |
-| 3 | **Projectors** | 768 → d, state → d | 🔥 | One linear layer each for language and vision. 2-layer MLP for proprio (normalised joint/EEF state). |
-| 4 | **Embeddings** | + d | 🔥 | Learned position + type embedding (lang / obs t−1 / obs t / proprio / world / action). |
-| 5 | **Trunk** | L × d | 🔥 | Pre-norm transformer, d = 1024, 24 layers, 16 heads, MLP ×4, bf16, SDPA attention. **~300M parameters**, the only big block. |
-| 6 | **World head** | 49 world queries → 49 × 768 | 🔥 | Predicts the frozen-encoder features of frame **t+k** (k = 4 to start). Target is stop-grad and LayerNorm'd. Loss: cosine + MSE. |
-| 7 | **Action head** | H action queries → H × 7 | 🔥 | v0: linear + **L1 regression** on a normalised action chunk (H = 8). v1: swap in a flow-matching head. |
+| 1 | Language encoder | instruction → 32 × 768 | frozen | SigLIP text tower, run once per task string |
+| 2 | Vision encoder | 224² RGB → 196 × 768 → 49 × 768 | frozen | SigLIP-B/16, 2×2 average pool, run once per frame |
+| 3 | Projectors | 768 → d; state → d | yes | linear for language/vision, 2-layer MLP for the 8-d state |
+| 4 | Embeddings | + d | yes | learned position + token-type embedding |
+| 5 | Trunk | 188 × d | yes | pre-norm transformer, SDPA attention, bf16 autocast |
+| 6 | World head | 49 world queries → 49 × 768 | yes | predicts $z_{t+k}$ |
+| 7 | Action head | 8 action queries → 8 × 7 | yes | linear, L1 regression (v0) |
 
-### Attention mask
+**Attention mask.** Context attends to context. World queries attend to context
+and world queries. Action queries attend to everything. Nothing attends to the
+action queries, so the world prediction cannot see the actions. The actions *can*
+read the predicted future, and that is how the world loss is meant to help.
 
-| query ↓ attends to → | context | world queries | action queries |
-|---|---|---|---|
-| context | ✅ | ❌ | ❌ |
-| world queries | ✅ | ✅ | ❌ |
-| action queries | ✅ | ✅ | ✅ |
+**Model sizes**
 
-Action queries can read the predicted future. That is how the world loss is
-meant to help the policy. Nothing reads the actions, so λ = 0 reduces exactly to
-plain BC with extra unused tokens.
+| Size | d | Layers | Heads | Parameters | Use |
+|---|---|---|---|---|---|
+| T | 256 | 4 | 4 | 3.9M | pipeline / overfit checks |
+| S | 512 | 8 | 8 | 26.8M | first real runs |
+| B | 1024 | 24 | 16 | ≈ 303M | main runs |
 
-### Loss
+**Inference.** Encoders run once per control step, then one trunk pass predicts
+an 8-step action chunk. The world head is not needed to act.
 
-```
-L = L1(â_{t:t+H}, a_{t:t+H})  +  λ · [ (1 − cos(ẑ_{t+k}, z_{t+k})) + MSE(ẑ_{t+k}, z_{t+k}) ]
-```
+### 2.4 Data-parallel training
 
-Actions are normalised per dataset (1st/99th percentile → [−1, 1]), and the
-gripper dimension is kept binary.
-
-### Inference
-
-The encoders run once per control step, then one trunk forward pass predicts an
-H-step action chunk. The world head is optional at test time: it is not needed
-to act, and it is useful only for visualising "what the model expects".
-
-### Deliberately left out of v0
-
-| Left out | Added in |
-|---|---|
-| pretrained VLM backbone | option B |
-| wrist camera | v1 |
-| flow-matching actions | v1 |
-| pixel-space prediction | later, via `../model.py`'s `VideoDiT` |
-| multi-dataset embodiment tokens | step 6 |
+The largest model fits on one 48 GB GPU, and sequences are short (188 tokens).
+That is the regime where plain **DDP** is the right choice (cf. the parallelism
+study in [`../parallelism/README.md`](../parallelism/README.md)). Tensor/pipeline parallelism would only
+add PCIe traffic. Batch size is set per GPU, so the global batch grows with the
+GPU count, and the learning rate is scaled by √(global-batch ratio).
 
 ---
 
-## Efficiency study: what each pipeline choice buys
+## 3. Experimental setup
 
-The question: how much compute and wall-clock does each choice save, and what
-does it cost in validation quality? Same policy model, same data, 1 node × 4 L40S.
+### 3.1 Data
 
-### Arms (each adds one change to the previous)
+**LIBERO** (spatial / object / goal / long suites), from the
+`physical-intelligence/libero` release (CC-BY-4.0):
 
-| # | Arm | Encoder | Input per step | Tokens/frame |
+| Episodes | Frames | Tasks | Control rate | Train / val |
 |---|---|---|---|---|
-| A0 | **reference** | SigLIP **fine-tuned** (fwd + bwd) | 224 px frames | 49 |
-| A1 | + frozen encoder | SigLIP frozen (fwd only, every step) | 224 px frames | 49 |
-| A2 | + pre-encoded features | none at train time | cached features | 196 (unpooled) |
-| A3 | + 2×2 token pooling | none | cached features | **49** (our v0) |
-| A4 | + large batch | none | cached features | 49, batch ×4 / GPU |
-| A5 | + batch sweep | none | cached features | find the useful-batch limit |
+| 1693 | 273,465 | 40 | 10 Hz | 260,231 / 13,234 frames (5% of episodes per task held out) |
 
-* A0's batch is the largest that fits before OOM. A1–A3 use the same batch where
-  it fits. A4/A5 then scale the batch.
-* A2 → A3 is our analogue of temporal compression: fewer tokens per frame.
-* Frame decoding is excluded from all arms (frames come from `img.npy`). The
-  study isolates the encoder and token-count effects.
+Frames are resized to 224², encoded once (11 min on one L40S) and stored as
+fp16 features. Only the agent-view camera is used in v0. The release's images
+are rotated 180°, and closed-loop evaluation applies the same rotation.
 
-### Measured per arm
+Planned later: **BridgeData V2** for pretraining (~60k episodes), then optionally
+Fractal (RT-1) as a second embodiment.
 
-| Metric | How |
+### 3.2 Hardware
+
+Nodes with 4× NVIDIA L40S (48 GB), PCIe, no NVLink. Measured NCCL all-reduce bus
+bandwidth (256 MB, bf16):
+
+| Scope | Transport | Bus bandwidth |
+|---|---|---|
+| 1 node, 4 GPUs | PCIe | **18.8 GB/s** |
+| 2 nodes, 8 GPUs | RoCE | **12.2 GB/s** (65% of intra-node) |
+
+### 3.3 Training protocol
+
+AdamW (β = 0.9/0.95, weight decay 0.05 on matrices), linear warmup then cosine
+decay, gradient clipping 1.0, bf16 autocast. Validation BC loss is computed on the
+held-out episodes every 500 steps.
+
+---
+
+## 4. Results
+
+### 4.1 Pipeline validation
+
+**r0** (T model, 1 GPU, 8 episodes, train = val): BC loss **0.104 → 0.014** in
+3000 steps (2 min). The model can memorise, so data, normalisation, masking and
+optimisation are correct end to end.
+
+### 4.2 Single-GPU baseline vs 1-node DDP (S model, λ = 0)
+
+Both runs see the same 1.28M samples (≈ 4.9 epochs).
+
+| Run | GPUs | Global batch | Steps | Samples/s | Wall-clock | Best val BC | Final train BC |
+|---|---|---|---|---|---|---|---|
+| r1 | 1 | 64 | 20,000 | 1,320 | 16.7 min | **0.131** | 0.094 |
+| r2 | 4 | 256 | 5,000 | **4,500** | **5.1 min** | 0.135 | 0.099 |
+
+* **Scaling:** 3.4× throughput on 4 GPUs, i.e. **85% efficiency**. The data
+  loader accounts for only 1–2% of step time.
+* **Batch size:** 4× the global batch costs ~2.5% in validation BC at an equal
+  sample budget.
+* **Generalisation gap:** validation BC plateaus at ≈ 0.133 from ~12k steps
+  while training BC keeps falling (0.094). With ~40 demos per task, the model
+  starts memorising. Closed-loop success, not validation loss, is the deciding
+  metric.
+
+### 4.3 In progress
+
+| Run | Setup | Question |
+|---|---|---|
+| r3a / r3b | B (≈ 303M), 4 GPUs, λ = 0 vs λ = 0.5 | does the world loss help at scale? |
+| sim | LIBERO simulator (MuJoCo 3.3, headless EGL) | closed-loop success rate per suite |
+
+---
+
+## 5. Planned work
+
+### 5.1 Efficiency study: what each pipeline choice buys
+
+Same policy, same data, 1 node × 4 GPUs. Each arm adds one change to the
+previous:
+
+| Arm | Encoder at train time | Tokens / frame |
+|---|---|---|
+| A0 reference | SigLIP fine-tuned (fwd + bwd) | 49 |
+| A1 | SigLIP frozen, run every step | 49 |
+| A2 | none: pre-encoded features | 196 (unpooled) |
+| A3 | none: pre-encoded + 2×2 pooling (v0) | 49 |
+| A4 / A5 | as A3, with batch scaled up / swept | 49 |
+
+Measured per arm: frames/s/GPU, tokens/s/GPU, time per epoch, peak VRAM, MFU
+(FLOPs from `torch.utils.flop_counter`), and **validation BC vs total compute**
+(encoder + policy FLOPs). Frame decoding is excluded from all arms. `report.py`
+will produce a one-page figure with summary table.
+
+### 5.2 Closed-loop evaluation
+
+Roll out each policy in the LIBERO simulator from the benchmark's fixed initial
+states, and report success rate per suite. This is the metric that decides
+λ = 0 vs λ > 0.
+
+### 5.3 DAgger (once BC reaches ≳ 30% success on a suite)
+
+LIBERO demonstrations are human teleoperation, so there is no scripted expert.
+The default teacher is a strong public LIBERO policy (checkpoint, licence and
+action convention to be verified). A privileged-state policy is the fallback.
+
+```
+D ← demos;  π_0 ← BC policy
+for i = 1..N (≈ 5–10):
+    roll out π_mix = β_i·expert + (1−β_i)·π_{i−1}      (β_i: 1 → 0)
+    label every visited state with the expert's action chunk
+    D ← D ∪ new samples;  π_i ← fine-tune π_{i−1} on D  (DDP)
+    evaluate π_i (success rate)
+```
+
+The executed action comes from π_mix, but the label is always the expert's.
+Rollout and training are separate jobs that communicate through data shards.
+**Control:** BC on the same amount of expert-only rollouts (β = 1), which
+separates "on-policy states" from "more data". Simulation only: Bridge has no
+expert to query.
+
+### 5.4 Scale-out
+
+Pretraining on BridgeData V2 (+ LIBERO-90), then fine-tuning and evaluating on the
+LIBERO suites. Multi-node DDP (2 → 4 nodes) only while measured scaling
+efficiency holds. Ablations: λ, k, model size, data mix, BC vs BC + DAgger.
+
+### 5.5 Left out of v0
+
+Pretrained VLM backbone · wrist camera · flow-matching action head ·
+pixel-space prediction (via `VideoDiT` in `../parallelism/src/model.py`) · per-embodiment tokens.
+
+---
+
+## 6. Reproducing
+
+All jobs are submitted from this folder. Arguments after the script name go to
+`train_bc.py`, and resubmitting the same `--name` resumes from `last.pt`.
+
+```bash
+sbatch slurm/setup_env.sh                       # venv + CPU smoke test
+sbatch slurm/check_gpu.sh                       # 4-GPU NCCL check
+sbatch slurm/multinode.sh smoke_test.py         # 2-node NCCL check
+J=$(sbatch --parsable slurm/prepare_libero.sh)  # download
+sbatch --dependency=afterok:$J --gres=gpu:l40s:1 --cpus-per-task=16 --mem=48G \
+       --time=02:00:00 slurm/prepare_libero.sh encode
+
+# r1: 1 GPU
+sbatch --time=06:00:00 slurm/train.sh --name r1_S_1gpu --size S --steps 20000 --batch 64 --lr 3e-4
+# r2: 1 node, 4 GPUs
+sbatch --gres=gpu:l40s:4 --cpus-per-task=32 --mem=160G --time=03:00:00 \
+       slurm/train.sh --name r2_S_4gpu --size S --steps 5000 --batch 64 --lr 6e-4 --warmup 200
+# r3: world loss on/off at 300M
+sbatch --gres=gpu:l40s:4 --cpus-per-task=32 --mem=160G --time=03:00:00 \
+       slurm/train.sh --name r3_B_4gpu_lam0.5 --size B --lam 0.5 --steps 5000 --batch 64
+# multi-node
+sbatch --nodes=2 --time=12:00:00 slurm/multinode.sh train_bc.py --name b_2n --size B
+```
+
+### Code
+
+| File | Role |
 |---|---|
-| frames/s/GPU, tokens/s/GPU | timed steps after warmup (`train_bc.py` metrics) |
-| time per epoch | 1 pass over the 273k-frame train split, 4 GPUs |
-| peak VRAM / GPU | `torch.cuda.max_memory_allocated` |
-| MFU | FLOPs counted with `torch.utils.flop_counter` on one step, against the L40S BF16 dense peak (362 TFLOPS, datasheet; verify) |
-| **val BC loss vs total compute** | total FLOPs (encoder fwd(+bwd) + policy fwd+bwd) up to each eval, log-scale x-axis |
-| steps / wall-clock / compute to best val | from `metrics.jsonl` |
-| later: LIBERO success rate | closed-loop, for the best arms only |
-
-### Output
-
-`report.py` turns the runs into a one-page figure (six panels + summary
-table, as in the reference report) under `$WM_RUNS/efficiency/`, plus a short
-write-up with the TL;DR numbers.
-
-### Budget
-
-Throughput, VRAM and MFU need only ~10 min per arm. Convergence (val vs
-compute) needs a full run per arm: A0/A1 are the expensive ones. They run to a
-fixed compute budget, not to convergence, unless they are still improving.
+| `prepare_libero.py` | download, frozen-encoder feature cache, split, normalisation stats |
+| `libero_data.py` | samples (obs t−1, obs t, state, action chunk, future features) from the cache |
+| `wla_model.py` | policy, attention mask, loss |
+| `train_bc.py` | 1-GPU / DDP training, live plot, resume, checkpoint policy |
+| `smoke_test.py`, `sim_test.py` | environment, NCCL and simulator checks |
+| `slurm/` | job scripts; `env.sh` / `sim_env.sh` hold the module stack and paths |
 
 ---
 
-## DAgger (after BC works)
+## Appendix A. Storage
 
-BC trains only on expert states, so at test time small errors push the policy
-into states it never saw, and the errors compound. DAgger fixes this by
-labelling the states *the learner* visits with expert actions, then retraining
-on the aggregate.
-
-**Gate:** start only once BC (step 3/4) reaches a non-trivial LIBERO success
-rate, roughly ≥ 30% on one suite. Below that, rollouts are mostly failure states
-far from the task, and labelling them teaches little.
-
-**Where:** LIBERO (simulation) only. Bridge is offline real-robot data with no
-expert to query, so it stays pure BC.
-
-### The expert
-
-LIBERO demos are human teleoperation, so there is no built-in expert to query.
-Options:
-
-| Expert | Pros | Cons |
-|---|---|---|
-| **A strong public LIBERO policy** (e.g. a π0/π0.5 or OpenVLA-OFT LIBERO checkpoint, ~95%+ success) | Ready now, same 7-DoF delta-EEF action space | Large (3–7B). Inference costs GPU time. Its mistakes become labels. |
-| Privileged-state policy (trained by us on sim state, not pixels) | Small, fast, cheap to query | Must be trained first, and must itself be good |
-
-**Default:** a public LIBERO checkpoint as teacher. Verify the exact checkpoint,
-licence and action convention before use.
-
-### Loop
-
-```
-D ← LIBERO demos;  π_0 ← BC policy (step 4)
-for i = 1..N (≈ 5–10 iterations):
-    roll out π_mix = β_i·expert + (1−β_i)·π_{i−1} in LIBERO   (β_i: 1 → 0, e.g. 0.5^i)
-    at every visited state: query expert → action chunk label
-    D ← D ∪ {(obs, lang, proprio, expert chunk, future frame)}
-    π_i ← fine-tune π_{i−1} on D  (4-GPU DDP; demos + all DAgger data)
-    eval π_i on held-out init states → success rate
-```
-
-* The executed action comes from `π_mix`, but the **label is always the
-  expert's**. The future-frame world target is whatever the simulator actually
-  rendered at t+k.
-* Mixing (β) keeps early rollouts near the task. It decays to pure learner
-  rollouts.
-* Rollouts and expert queries run as a separate job (parallel MuJoCo envs with
-  EGL rendering on a GPU node). Training is the usual DDP job. The two
-  communicate only through shards on `$SCRATCH`, so either side can be re-run on
-  its own.
-
-### Storage
-
-| What | Where | Kept |
-|---|---|---|
-| DAgger data | `$WM_DATA/dagger/iter_<i>/*.tar` | every iteration (this *is* the dataset) |
-| policy per iteration | `$WM_RUNS/<run>/dagger/iter_<i>/best.pt` | best only, weights only |
-| rollout videos | a few per iteration | for inspection only |
-
-### Measured
-
-* Success rate vs DAgger iteration, against BC on the **same number of extra
-  expert-only rollouts** (β = 1 throughout). This control shows whether the gain
-  comes from on-policy states or just from more expert data.
-* Effect of the world loss on DAgger (λ = 0 vs λ > 0).
-
----
-
-## Why DDP
-
-The model fits on one 48 GB GPU, and sequences are a few hundred tokens. In the
-regime studied in [`../README.md`](../README.md), that makes plain DDP the right
-call. TP/PP would only add communication over PCIe. FSDP/ZeRO-2 come back only if
-the model grows past ~1B.
-
-## Data
-
-| Role | Dataset | Notes |
-|---|---|---|
-| fine-tune + closed-loop eval | **LIBERO** | simulated, small, standard benchmark. Starts here. |
-| pretraining | **BridgeData V2** | ~60k language-labelled episodes, WidowX |
-| optional 2nd embodiment | Fractal (RT-1, OXE subset) | only if Bridge alone is too narrow |
-
-Sources are the LeRobot / Hugging Face versions, which avoid a TensorFlow/RLDS
-dependency. They are converted once into **tar shards** (224 px frames,
-normalised actions) and unpacked into `$SLURM_TMPDIR` at job start, because
-Lustre handles millions of small files badly. Check sizes before every download.
-
-## Plan
-
-1. **Env:** venv on `$SCRATCH` from the cluster wheelhouse; CPU smoke test.
-2. **Data:** LIBERO → shards + action normalisation stats.
-3. **1-GPU BC baseline** (λ = 0): overfit a few episodes, then train.
-4. **World loss:** λ > 0 vs λ = 0 on LIBERO success rate.
-5. **1 node, 4-GPU DDP:** throughput, checkpoint/resume across 12–24 h jobs.
-6. **DAgger on top of BC** (LIBERO only), once BC works. See [DAgger](#dagger-after-bc-works).
-7. **Pretrain on Bridge (+ LIBERO-90)** → fine-tune / eval on LIBERO suites.
-8. **Multi-node DDP**, then ablations (λ, horizon k, size, data mix, BC vs BC+DAgger).
-
----
-
-## Storage: where things go
-
-`/project/aip-zaiane` is **full** (12/12 TiB), and `$HOME` is only 50 GB. So:
+Project storage is full, and home is small, so only code lives in git. Everything
+heavy is on `$SCRATCH`, which is **not backed up** and is purged when idle.
 
 | What | Where |
 |---|---|
-| code, configs, this README | here, in git |
+| code, configs, this README | git |
 | venv | `$SCRATCH/World_Model_SSMs_Video_IMGGen/wm_venv` |
-| raw downloads + tar shards | `$SCRATCH/World_Model_SSMs_Video_IMGGen/dist_training/WM/data/` |
-| runs: logs, metrics, eval videos, checkpoints | `$SCRATCH/World_Model_SSMs_Video_IMGGen/dist_training/WM/runs/<run>/` |
-| HF / pip / W&B caches | `$SCRATCH/hf_cache`, `$SCRATCH/cache` |
-| per-job hot data | `$SLURM_TMPDIR` (node-local, wiped after the job) |
+| raw data + feature cache (≈ 185 GB) | `$SCRATCH/World_Model_SSMs_Video_IMGGen/dist_training/WM/data/` |
+| runs (metrics, live plot, checkpoints) | `$SCRATCH/.../WM/runs/<name>/`, linked here as `runs/` (git-ignored) |
+| job logs | `$SCRATCH/.../WM/logs/` |
+| HF / pip caches | `$SCRATCH/hf_cache`, `$SCRATCH/cache` |
 
-`$SCRATCH` is **not backed up** and idle files are purged. Raw data can be
-re-downloaded, but final checkpoints cannot. Copy a run's `best.pt` to
-`/project/aip-zaiane/...` once space has been freed there.
+Raw data can be re-downloaded. Final checkpoints worth keeping must be copied to
+project storage once space is available.
 
-## Checkpoints: only the important ones
+## Appendix B. Checkpoint policy
 
-Each run keeps at most three files, and never a checkpoint every N steps:
+Only rank 0 writes, and a run directory holds at most three checkpoints:
 
-| File | Contents | When written |
+| File | Contents | Written |
 |---|---|---|
-| `last.pt` | weights + optimizer + step + RNG | overwritten periodically (atomic write: tmp → rename). Exists only for resume. |
-| `best.pt` | weights only, bf16 | when the validation metric improves |
-| `final.pt` | weights only, bf16 | end of run, then `last.pt` is deleted |
+| `last.pt` | weights + optimizer + step | every 20 min (atomic tmp → rename), and on a time-budget stop. Deleted at the end of the run. |
+| `best.pt` | weights only, bf16 | when validation BC improves |
+| `final.pt` | weights only, bf16 | end of the run |
 
-At ~300M parameters a weights-only bf16 file is ~0.6 GB, and `last.pt` is ~4 GB.
-Only rank 0 writes.
+Each run also writes `metrics.jsonl`, `gpu_telemetry.csv`, `config.json` and
+`live.png`. The live plot refreshes every 60 s and shows train/val losses,
+throughput, data-wait fraction and per-GPU utilisation.
