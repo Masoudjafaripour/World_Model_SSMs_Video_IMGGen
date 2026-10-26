@@ -175,7 +175,62 @@ Both runs see the same 1.28M samples (≈ 4.9 epochs).
   starts memorising. Closed-loop success, not validation loss, is the deciding
   metric.
 
-### 4.3 In progress
+### 4.3 What the policy has learned (offline analysis, r1)
+
+All results below are on **held-out** demonstrations, using r1's best checkpoint
+(S model, step 13k, λ = 0). They come from `demo.py`, which needs no simulator.
+
+<p align="center"><img src="figures/episode_ep22.gif" width="760"/></p>
+
+*A held-out episode played at 2× speed. Left: camera frame, with colour showing
+where the action tokens attend. Right: predicted (orange) vs demonstrated
+(black) actions, with a moving cursor at the current step.*
+
+**Which inputs does the policy use?** Each input is replaced by another
+validation sample's, and the validation BC loss is recomputed:
+
+| Input swapped | Val BC (L1) | Increase |
+|---|---|---|
+| none (true inputs) | 0.133 | — |
+| instruction | 0.190 | +43% |
+| image (t−1, t) | 0.292 | +119% |
+| robot state | 0.354 | +166% |
+
+<p align="center"><img src="figures/input_reliance.png" width="520"/></p>
+
+The policy uses all three inputs. It leans most on the robot state, which is a
+known risk in BC (a "copycat" shortcut: the next action is partly predictable from
+the current pose). The instruction matters least on average, because most
+scenes host only one or a few tasks. Where one scene hosts many tasks, language
+does change the behaviour:
+
+**Same scene, different instruction.** LIBERO-goal uses one scene for ten
+instructions. With the image and state held fixed, the predicted 8-step motions
+separate by instruction. The mean deviation between instructions is 0.16, about
+the size of the policy's own error.
+
+<p align="center"><img src="figures/lang_swap.png" width="900"/></p>
+
+**Predicted vs demonstrated actions.** Mean absolute error per held-out episode
+is 0.13–0.17 (normalised units). The policy tracks the coarse motion and the
+gripper timing. It smooths fast reversals (e.g. dpitch / dyaw near t ≈ 120–140
+below), which is typical of L1 regression on a multimodal target and motivates
+the flow-matching head (§5.5).
+
+<p align="center"><img src="figures/actions_ep22.png" width="900"/></p>
+
+**Attention.** In the last layer, action tokens attend to the task-relevant
+objects as the episode progresses. Below: first the mug, then the microwave, then
+its door. The attention is not always this clean. In other episodes it often sits
+on the arm itself.
+
+<p align="center"><img src="figures/attention_ep0.png" width="900"/></p>
+
+Caveat: these are open-loop, offline checks against demonstrations. They show
+the policy uses vision and language sensibly. They do **not** show it completes
+tasks. That needs closed-loop rollouts (§5.2).
+
+### 4.4 In progress
 
 | Run | Setup | Question |
 |---|---|---|
@@ -277,6 +332,7 @@ sbatch --nodes=2 --time=12:00:00 slurm/multinode.sh train_bc.py --name b_2n --si
 | `libero_data.py` | samples (obs t−1, obs t, state, action chunk, future features) from the cache |
 | `wla_model.py` | policy, attention mask, loss |
 | `train_bc.py` | 1-GPU / DDP training, live plot, resume, checkpoint policy |
+| `demo.py` | offline demos: input reliance, language swap, action plots, attention, GIFs |
 | `smoke_test.py`, `sim_test.py` | environment, NCCL and simulator checks |
 | `slurm/` | job scripts; `env.sh` / `sim_env.sh` hold the module stack and paths |
 
