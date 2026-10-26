@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # dist_training/metrics.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "parallelism" / "src"))  # metrics.py
 import metrics as M  # noqa: E402
 from libero_data import LiberoFeatures  # noqa: E402
 from wla_model import SIZES, WLAPolicy, wla_loss  # noqa: E402

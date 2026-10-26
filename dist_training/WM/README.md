@@ -107,7 +107,7 @@ an 8-step action chunk. The world head is not needed to act.
 
 The largest model fits on one 48 GB GPU, and sequences are short (188 tokens).
 That is the regime where plain **DDP** is the right choice (cf. the parallelism
-study in [`../README.md`](../README.md)). Tensor/pipeline parallelism would only
+study in [`../parallelism/README.md`](../parallelism/README.md)). Tensor/pipeline parallelism would only
 add PCIe traffic. Batch size is set per GPU, so the global batch grows with the
 GPU count, and the learning rate is scaled by √(global-batch ratio).
 
@@ -240,7 +240,7 @@ efficiency holds. Ablations: λ, k, model size, data mix, BC vs BC + DAgger.
 ### 5.5 Left out of v0
 
 Pretrained VLM backbone · wrist camera · flow-matching action head ·
-pixel-space prediction (via `../model.py`'s `VideoDiT`) · per-embodiment tokens.
+pixel-space prediction (via `VideoDiT` in `../parallelism/src/model.py`) · per-embodiment tokens.
 
 ---
 
